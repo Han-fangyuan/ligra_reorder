@@ -1,0 +1,559 @@
+#!/bin/bash
+# regression tester for toplev
+# this just tests if all events resolve etc, as it would need the individual CPUs.
+# should cover near all code in toplev, except for specific error paths.
+# for non root set kernel.perf_event_paranoid = -1
+
+# WRAP=... to run toplev with specific python (e.g. WRAP=python3 or WRAP="coverage run --append")
+# DCPU=cpu to do more test on specific CPU
+# NOGROUP=1 disable testing for single top level group
+# NORES=1   disable checking for results
+# OPT=..    pass extra option to toplev
+# LOAD=...  override test load
+# LOADLONG= override longer running test load
+# LOAD0=..  override test load on cpu 0 (taskset)
+# NOCPUS=1  skip individual CPU tests
+
+set -e
+set -o pipefail
+set -u
+
+DEFAULTCPU=skl
+[ ! -r /sys/devices/cpu/format/any ] && DEFAULTCPU=icl
+
+WRAP=${WRAP:-}
+DCPU=${DCPU:-$DEFAULTCPU}
+OPT="${OPT:-}"
+MATCH=${MATCH:-}
+NOGROUP=${NOGROUP:-}
+NORES="${NORES:-}"
+PERF=${PERF:-perf}
+NMPI="" # XXX fix
+NOCPUS="${NOCPUS:-}"
+
+if [ -n "$WRAP" ] ; then
+	PYTHON=$WRAP
+else
+	PYTHON=python
+fi
+
+OPT="$OPT --perf"
+
+case "$PERF" in
+*fake-perf.py) NORES=1 ;;
+esac
+
+export TL_TESTER=1
+
+dumplogs() {
+	[ -f nflog$$ ] && (
+		sort nflog$$ | uniq > logsum$$
+		echo -n "unreferenced: " ; grep -c "unreferenced" logsum$$
+		egrep -v "missing (PMU|umask)|event_download|unreferenced" logsum$$
+	) && rm nflog$$ logsum$$
+}
+
+failed() {
+	echo FAILED
+	dumplogs
+}
+trap failed ERR 0
+
+. ./cpumap.sh
+
+rm -f nflog$$
+
+cat >hello.c <<EOL
+#include <stdio.h>
+int main() {
+	printf("Hello world\n");
+	return 0;
+}
+EOL
+
+set -x
+
+LOAD="${LOAD:--- gcc -O3 -o /dev/null hello.c}"
+LOADLONG=${LOADLONG:-./workloads/BC1s}
+LOAD0="-- taskset -c 0 $LOAD"
+
+set -o pipefail
+
+SMTCPUS="snb jkt ivb ivt hsw hsx bdw skl bdx knl skx clx icl tgl"
+NOSMTCPUS="slm simple"
+ALLCPUS="$SMTCPUS $NOSMTCPUS"
+
+ALL=--all
+
+checklog0() {
+	echo >> log$$
+	grep -v unparseable log$$
+}
+
+$WRAP ./toplev.py --force-cpu $DCPU $OPT $LOAD
+
+# test with a locale that outputs FP numbers with , (github issue #43)
+LC_ALL=pl_PL.utf8 $WRAP ./toplev.py --force-cpu $DCPU $OPT $LOAD
+
+DIRECT_MSR=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -l4 $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -l4 --single-thread $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -l4 --single-thread --columns $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc --all --core S0-C0-T0 $LOAD0 | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -v -l4 $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -x, -v -l4 $LOAD | tee log$$
+checklog0
+set +e
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc -r2 -l4 $LOAD
+# ignore perf segfault with -r, which happens in some versions
+if [ $? != 0 -a $? != 245 ] ; then failed ; fi
+set -e
+KERNEL_VERSION=2.1 $WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc --all $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc --metrics -x, -v -l4 $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -g --raw -v --debug --stats $ALL --kernel $LOAD | tee log$$
+checklog0
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc --stats $ALL --kernel --valcsv val$$.csv --no-multiplex $LOAD | tee log$$
+checklog0
+grep :k log$$
+grep /k log$$
+EVENTMAP=${cpus[$DCPU]} FORCECPU=simple $WRAP ./toplev.py $OPT --no-desc -l1 $LOAD
+# check errata handling
+EVENTMAP=GenuineIntel-6-56 FORCECPU=bdw $WRAP ./toplev.py $OPT --filterquals --handle-errata --force-events --no-desc --all $LOAD 2>&1 | tee log$$
+grep BDE70 log$$
+$WRAP ./toplev.py --force-cpu skl $OPT --filterquals --nodes '!+Bad_Speculation.Branch_Mispredicts^' -o log$$ -v $LOAD
+[ -z "$NORES" ] && grep Branch_Misprediction_Cost log$$
+[ -z "$NORES" ] && grep IpMispredict log$$
+[ -z "$NORES" ] && grep Branch_Mispredicts log$$
+[ -z "$NORES" ] && grep Mispredicts_Resteers log$$
+$WRAP ./toplev --force-cpu skl --filterquals $OPT --force-bn=Mispredicts_Resteers --force-bn=Frontend_Bound --force-bn=Fetch_Latency --force-bn Branch_Resteers --no-desc --drilldown -o log$$ $LOADLONG
+[ -z "$NORES" ] && grep Branch_Misprediction_Cost log$$
+[ -z "$NORES" ] && grep IpMispredict log$$
+[ -z "$NORES" ] && grep Branch_Mispredicts log$$
+[ -z "$NORES" ] && grep Mispredicts_Resteers log$$
+rm log$$
+$WRAP ./toplev.py --show-cpu
+
+case "$OPT" in
+	*--pinned*) ;;
+	*)
+KERNEL_VERSION=5.10 $WRAP ./toplev.py --force-cpu $DCPU $OPT --exclusive --all --no-desc --print $LOAD | tee log$$
+grep :e log$$
+rm log$$
+esac
+
+case "$OPT" in
+	*--exclusive*) ;;
+	*)
+FORCEMETRICS=1 $WRAP ./toplev.py --force-cpu icl --pinned --print --all | tee log$$
+grep :D log$$
+rm log$$
+esac
+
+$WRAP ./toplev -h > /dev/null
+
+# test L1 uses a single group
+onegroup() {
+	if [ `cat /proc/sys/kernel/nmi_watchdog` = 1 ] ; then return ; fi
+	if [ -n "$NOGROUP" ] ; then return ; fi
+	case "$OPT" in *--drilldown*) return ;; esac
+	grep perf $1 |
+		 sed -E -e 's/topdown-retiring,?//;s/topdown-be-bound,?//;s/topdown-fe-bound,?//;s/slots,?//;s/topdown-bad-spec,?//;s/\{\}//' |
+		tr -cd '{}' |
+		awk ' { if ($1 != "{}") { print "more than one group for L1" ; exit(1); } } '
+}
+
+badschedules=0
+badschedlist=""
+
+checklog() {
+	echo >> $1
+	grep -v unparseable $1
+	if grep "not supported 100.00%" $1 ; then
+		echo "WARNING unsupported schedule in $1"
+		badschedules=$[$badschedules + 1]
+		badschedlist="$badschedlist $1"
+	fi
+}
+
+notfound() {
+	egrep "not found|missing|unreferenced" log$$.$1 || true
+	egrep "not found|missing|unreferenced" log$$.$1 | sed "s/^/$1:/" >> nflog$$ || true
+}
+if [ -z "$NOCPUS" ] ; then
+for j in $SMTCPUS ; do
+	[ "$MATCH" != "" -a "$MATCH" != "$j" ] && continue
+if ! grep -q hypervisor /proc/cpuinfo ; then
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $j --force-topology topology --force-events -l1 --filterquals $OPT $LOAD 2>&1 | tee log$$.$j
+[ $j != "knl" ] && onegroup log$$.$j
+checklog log$$.$j
+notfound $j
+fi
+FORCEHT=0 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events -l1 --filterquals $OPT $LOAD 2>&1 | tee log$$.$j
+[ $j != "knl" ] && onegroup log$$.$j
+checklog log$$.$j
+notfound $j
+if ! grep -q hypervisor /proc/cpuinfo ; then
+FORCEHT=1 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events $ALL --filterquals $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+FORCEHT=1 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events $ALL --filterquals $OPT --user $LOAD 2>&1
+checklog log$$.$j
+notfound $j
+
+fi
+FORCEHT=0 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+
+FORCEHT=0 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals --user $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+
+case "$OPT" in
+*--exclusive*) ;;
+*)
+FORCEHT=1 FORCE_NMI_WATCHDOG=1 \
+$WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+esac
+
+FORCEHT=0 \
+$WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events $ALL --filterquals $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+
+HYPERVISOR=1 FORCEHT=0 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+HYPERVISOR=1 FORCEHT=1 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+
+if [ $j = "skl" -o $j = "skx" ] ; then
+REDUCED_COUNTERS=1 FORCEHT=1 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+REDUCED_COUNTERS=1 FORCEHT=0 $WRAP ./toplev.py --force-topology topology --force-cpu $j --force-events --filterquals $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+fi
+
+if [ $j == "icl" -o $j == "tgl" ] ; then
+
+FORCEMETRICS=1 $WRAP ./toplev.py --force-cpu $j --filterquals --force-topology topology --force-events --print $ALL $OPT $LOAD | tee log$$
+grep topdown- log$$
+rm log$$
+
+FORCEMETRICS=1 $WRAP ./toplev.py --force-cpu $j --filterquals --pinned --force-topology topology --force-events --print $ALL $OPT $LOAD | tee log$$
+grep topdown- log$$
+grep :D log$$
+rm log$$
+
+fi # icl
+
+done
+
+for j in $NOSMTCPUS ; do
+	[ "$MATCH" != "" -a "$MATCH" != "$j" ] && continue
+$WRAP ./toplev.py --force-cpu $j $OPT -l1 $LOAD 2>&1 | tee log$$.$j
+# SLM now needs two groups
+[ $j != "slm" ] && onegroup log$$.$j
+checklog log$$.$j
+$WRAP ./toplev.py --force-cpu $j $ALL $OPT $LOAD 2>&1 | tee log$$.$j
+checklog log$$.$j
+notfound $j
+done
+fi
+
+# misc features
+$WRAP ./toplev.py -g --force-cpu $DCPU $OPT -o log$$ --valcsv val$$.csv --perf-output perfo$$.csv --ignore-errata --stats --metrics --force-events --no-multiplex -l4 $LOAD
+[ -z "$NORES" ] && grep Turbo_Utilization log$$
+[ -z "$NORES" ] && grep -v "not supported" log$$
+rm log$$ val$$.csv perfo$$.csv
+
+if [ -n "$NMPI" ] ; then
+$WRAP ./toplev.py -I 100 -g --force-cpu $DCPU $OPT -o log$$ --valcsv val$$.csv --perf-output perfo$$.csv --ignore-errata \
+	--stats --force-events --no-multiplex -l3 --perf-summary perfs$$.csv \
+	$LOADLONG
+$WRAP ./toplev.py -g -l3 --ignore-errata --force-events --import perfs$$.csv
+rm perfo$$.csv perfs$$.csv
+fi
+
+# always on native CPU
+$WRAP ./toplev.py --all --valcsv val$$.csv --perf-output perfo$$.csv -o log$$ $LOADLONG
+[ -z "$NORES" ] && grep -v "not supported" log$$
+rm val$$.csv perfo$$.csv log$$
+
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT --raw -v -l3 --no-desc -a $LOAD
+$WRAP ./toplev.py -g --force-cpu $DCPU $OPT -o log$$ --valcsv val$$.csv --perf-output perfo$$.csv --all --fast $LOAD
+[ -z "$NORES" ] && grep Turbo_Utilization log$$
+[ -z "$NORES" ] && grep -q -v "not supported" perfo$$.csv
+rm log$$ val$$.csv perfo$$.csv
+
+test_subset() {
+SHOPT="-I100 -a -A --force-cpu $DCPU $OPT -l3 --metric-group +Summary --no-desc $1"
+$WRAP ./toplev.py $SHOPT --perf-output x$$.csv -o log-all0.$$ $LOADLONG
+$WRAP ./toplev.py $SHOPT --import x$$.csv -o log-all.$$
+diff -wu log-all0.$$ log-all.$$
+$WRAP ./toplev.py $SHOPT --subset 0/50% --valcsv val.0.$$.csv --import x$$.csv -o log-1.$$
+$WRAP ./toplev.py $SHOPT --subset 1/50% --valcsv val.1.$$.csv --import x$$.csv -o log-2.$$
+cat log-{1,2}.$$ | sed -e '/^#/d' > log-combined.$$
+sed -e '/^#/d' log-all.$$ > log-allf.$$
+diff -wu log-combined.$$ log-allf.$$
+rm log-{1,2,combined,all,allf,all0}.$$ val.{0,1}.$$.csv
+$WRAP ./toplev.py $SHOPT --subset 0-1000 --import x$$.csv
+TLSEED=1 \
+$WRAP ./toplev.py $SHOPT --subset 'sample:10%' --import x$$.csv
+}
+
+test_subset ""
+test_subset "--setvar DURATION_TIME=0"
+
+xz x$$.csv
+$WRAP ./toplev.py $SHOPT --import x$$.csv.xz -o y$$.out
+[ -z "$NORES" ] && grep IPC y$$.out
+xz -d x$$.csv.xz
+gzip x$$.csv
+$WRAP ./toplev.py $SHOPT --import x$$.csv.gz -o y$$.out.gz
+[ -z "$NORES" ] && zgrep IPC y$$.out.gz
+rm x$$.csv.gz y$$.out.gz
+
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --no-multiplex --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu bdw $OPT --cpu 0,1,2,3 --force-cpuinfo bdw-cpuinfo --stats --metrics --per-core --columns --filterquals -l4 $LOAD
+DURATION_TIME=0 $WRAP ./toplev.py -I100 --force-cpu $DCPU $OPT --all $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --per-socket --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --per-thread --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --drilldown $LOAD
+if $PYTHON -c 'import xlsxwriter' ; then
+$WRAP ./toplev.py --xlsx x$$.xlsx --force-cpu $DCPU $OPT --all --columns $LOAD
+rm x$$.xlsx
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --xlsx x$$.xlsx --all $LOAD
+rm x$$.xlsx # must exist
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --xlsx x$$.xlsx -l6 --metrics --single-thread $LOAD
+rm x$$.xlsx # must exist
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --xlsx x$$.xlsx --xnormalize --all $LOAD
+rm x$$.xlsx # must exist
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --xlsx x$$.xlsx -I100 --xchart --all $LOAD
+rm x$$.xlsx # must exist
+
+fi
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --per-thread -x, --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -I100 --per-thread --json --all -o j$$.json $LOAD
+cat j$$.json | $PYTHON -m json.tool
+rm j$$.json
+
+for MODE in -l3 "-a -A --all" ; do
+# exclude MUX for now because it has small variances, as well as /sec nodes
+COMMON="--force-cpu $DCPU $OPT -I100 --no-desc --summary --no-output --no-uncore --nodes=-MUX"
+
+$WRAP ./toplev.py $COMMON $MODE --perf-summary perfs$$.csv --perf-output perfo$$.csv -o log$$ --valcsv val.1.$$.csv $LOADLONG
+$WRAP ./toplev.py $COMMON $MODE --import perfs$$.csv --perf-output perfo.1.$$.csv --valcsv val.2.$$.csv -o log2.$$
+diff -uw log$$ log2.$$
+$WRAP ./toplev $COMMON $MODE --import perfo$$.csv --perf-output perfo.2.$$.csv --valcsv val.3.$$.csv -o log3.$$
+diff -uw log$$ log3.$$
+rm log{,2.,3.}$$ perf{s,o}$$.csv perfo.{1,2}.$$.csv val.{1,2,3}.$$.csv
+done
+
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -I100 --summary --per-thread --global --per-core --per-socket --json --all -o j$$.json $LOAD
+cat j$$.json | $PYTHON -m json.tool
+rm j$$.json
+
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --split-output -I100 --per-thread --global --per-core --per-socket --json --all -o j$$.json $LOAD
+cat j$$-core.json | $PYTHON -m json.tool
+cat j$$-global.json | $PYTHON -m json.tool
+cat j$$-socket.json | $PYTHON -m json.tool
+cat j$$-thread.json | $PYTHON -m json.tool
+rm j$$-core.json j$$-thread.json j$$-socket.json j$$-global.json
+
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -l1 --drilldown --json --all -o j$$.json $LOAD
+cat j$$.json | $PYTHON -m json.tool
+rm j$$.json
+
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --global --per-core -x, --columns -l4 $LOAD
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics --global -x, --columns -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics  --per-thread --per-core --per-socket --summary -a -l4 --filterquals $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --split-output -o out$$ --metrics  --per-thread --per-core --per-socket --global --summary --filterquals -x, -a -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics  --per-thread --per-core --per-socket --global --summary --filterquals -x, -a -l4 $LOAD
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --split-output -o out$$ --metrics  --per-thread --per-core --per-socket --global --summary --columns --filterquals -x, -a -l4 $LOAD
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics  --per-thread --per-core --per-socket --global --summary --columns --filterquals -x, -a -l4 $LOAD
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --split-output -o out$$ --metrics  --per-thread --per-core --per-socket --global --summary --filterquals --columns -x, -a -l4 $LOAD
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT --stats --metrics  --per-thread --per-core --per-socket --global --summary --filterquals --columns -x, -a -l4 $LOAD
+rm out$$-*
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --all --single-thread  --per-thread --per-core --per-socket --filterquals --summary -a -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-perf --no-desc --power -l4 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc $ALL --no-group $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-desc --sw -l4 $LOAD
+FORCE_COUNTERS=4 \
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --single-thread --user $LOAD | tee log$$
+onegroup log$$
+grep '[:/]u' log$$
+grep /u log$$
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --list-all
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --list-all -x,
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --list-metric-groups
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --describe Frontend_Bound
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --all --print
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --no-uncore $LOAD
+$WRAP ./toplev.py --force-hypervisor --force-cpu $DCPU $OPT $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --metric-group +TopDownL1,TLB $LOAD
+$WRAP ./toplev.py -o log$$ --force-cpu $DCPU $OPT -v --nodes IPC,Frontend_Bound,Backend_Bound* -l3 $LOAD
+echo >> log$$
+[ -z "$NORES" ] && grep MS_Switches log$$
+[ -z "$NORES" ] && grep IPC log$$
+checklog0
+rm log$$
+$WRAP ./toplev.py $OPT > log$$ true
+# assumes that true is backend_bound. If not would need some parsing
+[ -z "$NORES" ] && egrep "Add --nodes.*(Back|Front)end" log$$
+rm log$$
+$WRAP ./toplev.py  -v $OPT --nodes Backend*/3 -o log$$ true
+echo >> log$$
+[ -z "$NORES" ] && grep Backend_Bound.Memory_Bound.L3_Bound log$$
+[ -z "$NORES" ] && grep -v Backend_Bound.Core_Bound.Ports_Utilization.Ports_Utilized_0 log$$
+rm log$$
+if $PYTHON -c 'import matplotlib.pyplot' ; then
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --graph -o x$$.png --all $LOAD
+[ `stat -c %s x$$.png` -gt 1000 ]
+fi
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -l4 -I 100 $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ -m -l4 -I 100 $LOAD
+[ -z "$NORES" ] && grep IPC log$$
+checklog0
+rm log$$
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -l4 -I 100 --columns $LOAD
+$WRAP ./toplev.py --force-cpu $DCPU $OPT -l4 -I 100 --valcsv val$$.csv --columns -v -o out$$.gz -x, $LOAD
+[ -z "$NORES" ] && zgrep Frontend out$$.gz
+rm out$$.gz
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --all --valcsv val$$.csv.gz $LOAD | tee log$$
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --all --valcsv val$$.csv.xz --user $LOAD | tee log$$
+if [ -z "$NORES" ] ; then
+grep cpu_clk_unhalted val$$.csv
+grep Timestamp val$$.csv
+zgrep cpu_clk_unhalted val$$.csv.gz
+zgrep Timestamp val$$.csv.gz
+fi
+grep :u log$$
+grep /u log$$
+rm log$$
+rm val$$.csv.xz val$$.csv.gz val$$.csv
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --all --sample-basename perf$$.data --sample-repeat 5 --filterqual -a sleep 0.1  | tee log$$
+# do all perf.data exist?
+rm perf$$.data.{1,2,3,4,5}
+if $PYTHON -c 'import xlsxwriter' ; then
+$WRAP ./toplev.py --force-cpu $DCPU $OPT --sample-basename perf$$.data --xlsx x$$.xlsx --sample-repeat 3 --filterqual -a $LOAD | tee log$$
+rm perf$$.data.{1,2,3}
+rm x$$.xlsx
+fi
+
+$WRAP ./toplev.py $OPT -v -o log$$ --single-thread -r3 $LOAD
+[ -z "$NORES" ] && grep 'Backend_Bound.*[0-9][0-9]' log$$
+
+rm log$$
+
+# test other perf output formats
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -v -I 1000 -a --per-core $LOAD
+checklog0
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -I 1000 -a --per-core $LOAD
+checklog0
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -I 1000 -a --per-socket $LOAD
+checklog0
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -I 1000 -a --per-socket --filterquals $LOAD
+checklog0
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --no-desc --all -I 1000 -a -A --idle-threshold 20 $LOAD
+checklog0
+FORCEHT=0 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --summary --no-desc --no-area --all -I 1000 -a -A $LOAD
+checklog0
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -I 1000 -a --per-thread --filterquals $LOAD
+checklog0
+FORCEHT=1 $WRAP ./toplev.py --force-cpu $DCPU $OPT -o log$$ --all -I 1000 -a --no-output $LOAD
+
+$WRAP ./toplev.py --force-cpu hsx --filterquals $OPT -l4 true
+
+# test gen-script / import
+$WRAP ./toplev.py --all --gen-script > script$$
+chmod +x script$$
+OUT=tltest$$ ./script$$ $LOAD
+$WRAP ./toplev.py --all --import tltest$$_perf.csv --force-cpuinfo tltest$$_cpuinfo --force-topology tltest$$_topology
+rm tltest$$_perf.csv tltest$$_topology tltest$$_cpuinfo script$$
+
+if $PERF stat record --quiet true >/dev/null 2>/dev/null ; then
+$WRAP ./toplev.py --script-record --all --gen-script > script$$
+chmod +x script$$
+OUT=tltest$$ ./script$$ $LOAD
+$WRAP ./toplev.py --script-record --all --import tltest$$_perf.data --force-cpuinfo tltest$$_cpuinfo --force-topology tltest$$_topology
+rm tltest$$_perf.data tltest$$_topology tltest$$_cpuinfo script$$
+fi
+
+if $PYTHON -c 'import xlsxwriter' ; then
+$WRAP ./toplev.py --xlsx dummy.xlsx --all --gen-script > script$$
+chmod +x script$$
+OUT=tltest$$ ./script$$ $LOAD
+$WRAP ./toplev.py --all --import tltest$$_perf.csv --force-cpuinfo tltest$$_cpuinfo --force-topology tltest$$_topology --xlsx x$$.xlsx
+rm x$$.xlsx
+rm tltest$$_perf.csv tltest$$_topology tltest$$_cpuinfo script$$
+fi
+
+ARG="-a -A --all -I100 --summary --no-desc --no-uncore --nodes=-MUX"
+$WRAP ./toplev.py $ARG -o log0.$$ --perf-output perfo0.$$.csv --valcsv perfv0.$$.csv $LOADLONG
+$WRAP ./toplev.py --import perfo0.$$.csv $ARG -o log1.$$ --perf-output perfo1.$$.csv --valcsv perfv1.$$.csv
+diff -u perfo0.$$.csv perfo1.$$.csv | head
+diff -u perfv0.$$.csv perfv1.$$.csv | head
+diff -wu log0.$$ log1.$$
+$WRAP ./toplev.py --parallel --import perfo0.$$.csv $ARG -o log2.$$ --perf-output perfo2.$$.csv --valcsv perfv2.$$.csv
+diff -u perfo1.$$.csv perfo2.$$.csv | head
+diff -u perfv1.$$.csv perfv2.$$.csv | head
+diff -wu log1.$$ log2.$$
+$WRAP ./toplev.py --parallel --import perfo0.$$.csv $ARG --json -o j$$.json
+cat j$$.json | $PYTHON -m json.tool
+if $PYTHON -c 'import xlsxwriter' ; then
+$WRAP ./toplev.py --parallel --import perfo0.$$.csv $ARG --xlsx x$$.xlsx
+rm x$$.xlsx
+fi
+rm log[012].$$ perf[ov][012].$$.csv j$$.json
+
+# check current platform
+$WRAP ./toplev.py -o /dev/null $OPT --no-desc -v --all --run-sample $LOAD
+HYPERVISOR=1 $WRAP ./toplev.py $OPT -o /dev/null --no-desc -v -l5 --run-sample $LOAD
+for cpu in $SMTCPUS ; do
+	[ "$MATCH" != "" -a "$MATCH" != "$cpu" ] && continue
+
+FORCEHT=1 \
+$WRAP ./toplev.py --force-cpu $cpu $OPT --force-topology topology -o /dev/null --force-events --no-desc -v --all --filterqual --show-sample $LOAD >&log$$
+cat log$$
+# need to ignore errors for now to allow testing on laptop for uncore events
+notfound $cpu
+if ! grep -q hypervisor /proc/cpuinfo ; then
+[ "$cpu" != knl ] && grep [/:]p log$$
+[ "$cpu" = hsw -o "$cpu" = bdw -o "$cpu" = skl ] && grep [:/]pp log$$
+fi
+done
+for cpu in $NOSMTCPUS ; do
+	[ "$MATCH" != "" -a "$MATCH" != "$cpu" ] && continue
+$WRAP ./toplev.py --force-cpu $cpu $OPT -o /dev/null --force-events --no-desc -v --all --filterqual --show-sample $LOAD >&log$$
+cat log$$
+notfound $cpu
+done
+
+trap "" ERR 0
+
+set +x +e
+echo
+echo "$badschedules bad schedules: $badschedlist"
+if [ -z "$NOCPUS" ] ; then
+for i in $ALLCPUS ; do
+	[ "$MATCH" != "" -a "$MATCH" != "$cpu" ] && continue
+	rm log$$.$i ;
+done
+fi
+dumplogs
+times
+echo
+echo "SUCCEEDED"
